@@ -1,6 +1,22 @@
+import 'dart:async';
+import 'dart:io';
 import 'dart:ui';
+
 import 'package:flutter/material.dart';
+import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
+import 'package:html/parser.dart' as html_parser;
+import 'package:http/http.dart' as http;
+import 'package:image_picker/image_picker.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:speech_to_text/speech_to_text.dart' as stt;
+
+import '../models/history_model.dart';
+import '../services/fallback_analyzer.dart';
 import '../services/gemini_service.dart';
+import '../services/history_service.dart';
+import 'history_screen.dart';
+import 'login_screen.dart';
+import 'chat_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   final String userName;
@@ -17,11 +33,25 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen>
     with SingleTickerProviderStateMixin {
   final newsController = TextEditingController();
+  final urlController = TextEditingController();
 
   bool isLoading = false;
+  bool isListening = false;
   Map<String, dynamic>? result;
 
   late AnimationController glowController;
+  Timer? loadingTimer;
+  int loadingIndex = 0;
+
+  final stt.SpeechToText speech = stt.SpeechToText();
+
+  final List<String> loadingMessages = [
+    "Reading news content...",
+    "Detecting suspicious wording...",
+    "Checking misinformation patterns...",
+    "Calculating trust score...",
+    "Generating final verdict...",
+  ];
 
   @override
   void initState() {
@@ -33,11 +63,165 @@ class _HomeScreenState extends State<HomeScreen>
     )..repeat(reverse: true);
   }
 
+  void startLoadingMessages() {
+    loadingTimer?.cancel();
+    loadingIndex = 0;
+
+    loadingTimer = Timer.periodic(const Duration(milliseconds: 900), (timer) {
+      if (!mounted) return;
+
+      setState(() {
+        loadingIndex = (loadingIndex + 1) % loadingMessages.length;
+      });
+    });
+  }
+
+Widget _chatButton() {
+  return SizedBox(
+    width: double.infinity,
+    height: 55,
+    child: ElevatedButton.icon(
+      onPressed: result == null
+          ? null
+          : () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => ChatScreen(
+                    newsText: newsController.text.trim(),
+                    analysisResult: result!,
+                  ),
+                ),
+              );
+            },
+      icon: const Icon(Icons.chat_bubble_outline_rounded),
+      label: const Text(
+        "Chat About This News",
+        style: TextStyle(
+          fontSize: 17,
+          fontWeight: FontWeight.bold,
+        ),
+      ),
+    ),
+  );
+}
+
+  void stopLoadingMessages() {
+    loadingTimer?.cancel();
+  }
+
   Future<void> analyzeNews() async {
     String news = newsController.text.trim();
 
     if (news.isEmpty) {
-      showMessage("Please paste some news text first");
+      showMessage("Please paste, extract, or speak some news text first");
+      return;
+    }
+
+    setState(() {
+      isLoading = true;
+      result = null;
+    });
+
+    startLoadingMessages();
+
+    try {
+      await Future.delayed(const Duration(seconds: 2));
+
+      final aiResult = await GeminiService.analyzeNews(news);
+      aiResult["analysis_type"] = "Gemini AI Analysis";
+
+      setState(() {
+        result = aiResult;
+      });
+
+      await saveToHistory(news, aiResult);
+    } catch (e) {
+      print(e);
+
+      final fallbackResult = FallbackAnalyzer.analyze(news);
+
+      setState(() {
+        result = fallbackResult;
+      });
+
+      await saveToHistory(news, fallbackResult);
+
+      showMessage("Gemini limit reached. Showing backup TruthLens analysis.");
+    }
+
+    stopLoadingMessages();
+
+    setState(() {
+      isLoading = false;
+    });
+  }
+
+  Future<void> saveToHistory(String news, Map<String, dynamic> data) async {
+    await HistoryService.saveHistory(
+      HistoryModel(
+        news: news,
+        verdict: data["verdict"] ?? "Unknown",
+        trustScore: int.tryParse(data["trust_score"].toString()) ?? 0,
+        time: DateTime.now().toString(),
+      ),
+    );
+  }
+
+  Future<void> pickAndReadScreenshot() async {
+    final picker = ImagePicker();
+
+    final XFile? image = await picker.pickImage(
+      source: ImageSource.gallery,
+    );
+
+    if (image == null) return;
+
+    setState(() {
+      isLoading = true;
+      result = null;
+    });
+
+    try {
+      final inputImage = InputImage.fromFile(File(image.path));
+
+      final textRecognizer = TextRecognizer(
+        script: TextRecognitionScript.latin,
+      );
+
+      final RecognizedText recognizedText =
+          await textRecognizer.processImage(inputImage);
+
+      await textRecognizer.close();
+
+      String extractedText = recognizedText.text.trim();
+
+      if (extractedText.isEmpty) {
+        showMessage("No readable text found in this screenshot");
+      } else {
+        newsController.text = extractedText;
+        showMessage("Screenshot text extracted successfully");
+      }
+    } catch (e) {
+      print(e);
+      showMessage("Could not read text from screenshot");
+    }
+
+    setState(() {
+      isLoading = false;
+    });
+  }
+
+  Future<void> fetchNewsFromUrl() async {
+    final url = urlController.text.trim();
+
+    if (url.isEmpty) {
+      showMessage("Please enter a news URL first");
+      return;
+    }
+
+    if (!url.startsWith("http://") && !url.startsWith("https://")) {
+      showMessage("Please enter a valid URL starting with http or https");
       return;
     }
 
@@ -47,20 +231,109 @@ class _HomeScreenState extends State<HomeScreen>
     });
 
     try {
-      await Future.delayed(const Duration(seconds: 2));
-      final aiResult = await GeminiService.analyzeNews(news);
+      final response = await http.get(Uri.parse(url)).timeout(
+            const Duration(seconds: 12),
+          );
 
-      setState(() {
-        result = aiResult;
-      });
+      if (response.statusCode != 200) {
+        showMessage("Could not open this URL");
+      } else {
+        final document = html_parser.parse(response.body);
+
+        document.querySelectorAll("script, style, nav, footer, header").forEach(
+              (element) => element.remove(),
+            );
+
+        final title = document.querySelector("title")?.text.trim() ?? "";
+        final paragraphs = document
+            .querySelectorAll("p")
+            .map((p) => p.text.trim())
+            .where((text) => text.length > 40)
+            .take(12)
+            .join("\n\n");
+
+        final extractedText = "$title\n\n$paragraphs".trim();
+
+        if (extractedText.length < 80) {
+          showMessage("Could not extract enough article text from this URL");
+        } else {
+          newsController.text = extractedText;
+          showMessage("Article text extracted from URL");
+        }
+      }
     } catch (e) {
       print(e);
-      showMessage("AI limit reached or error occurred. Try again later.");
+      showMessage("URL extraction failed. Try another link.");
     }
 
     setState(() {
       isLoading = false;
     });
+  }
+
+  Future<void> startVoiceInput() async {
+    if (isListening) {
+      await speech.stop();
+      setState(() {
+        isListening = false;
+      });
+      return;
+    }
+
+    final available = await speech.initialize(
+      onStatus: (status) {
+        if (status == "done" || status == "notListening") {
+          if (mounted) {
+            setState(() {
+              isListening = false;
+            });
+          }
+        }
+      },
+      onError: (error) {
+        showMessage("Voice input error. Try again.");
+        if (mounted) {
+          setState(() {
+            isListening = false;
+          });
+        }
+      },
+    );
+
+    if (!available) {
+      showMessage("Speech recognition is not available on this device");
+      return;
+    }
+
+    setState(() {
+      isListening = true;
+    });
+
+    await speech.listen(
+      listenFor: const Duration(seconds: 40),
+      pauseFor: const Duration(seconds: 4),
+      partialResults: true,
+      onResult: (result) {
+        setState(() {
+          newsController.text = result.recognizedWords;
+          newsController.selection = TextSelection.fromPosition(
+            TextPosition(offset: newsController.text.length),
+          );
+        });
+      },
+    );
+  }
+
+  Future<void> logoutUser() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool("isLoggedIn", false);
+
+    Navigator.pushReplacement(
+      context,
+      MaterialPageRoute(
+        builder: (_) => const LoginScreen(),
+      ),
+    );
   }
 
   void showMessage(String msg) {
@@ -75,7 +348,9 @@ class _HomeScreenState extends State<HomeScreen>
   Color getRiskColor(String verdict) {
     String value = verdict.toLowerCase();
 
-    if (value.contains("fake")) {
+    if (value.contains("invalid")) {
+      return Colors.grey;
+    } else if (value.contains("fake")) {
       return Colors.redAccent;
     } else if (value.contains("doubtful")) {
       return Colors.orangeAccent;
@@ -87,7 +362,9 @@ class _HomeScreenState extends State<HomeScreen>
   IconData getRiskIcon(String verdict) {
     String value = verdict.toLowerCase();
 
-    if (value.contains("fake")) {
+    if (value.contains("invalid")) {
+      return Icons.error_outline_rounded;
+    } else if (value.contains("fake")) {
       return Icons.warning_amber_rounded;
     } else if (value.contains("doubtful")) {
       return Icons.help_outline_rounded;
@@ -99,14 +376,18 @@ class _HomeScreenState extends State<HomeScreen>
   @override
   void dispose() {
     newsController.dispose();
+    urlController.dispose();
     glowController.dispose();
+    loadingTimer?.cancel();
+    speech.stop();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     final verdict = result?["verdict"]?.toString() ?? "";
-    final trustScore = int.tryParse(result?["trust_score"]?.toString() ?? "0") ?? 0;
+    final trustScore =
+        int.tryParse(result?["trust_score"]?.toString() ?? "0") ?? 0;
     final redFlags = result?["red_flags"] ?? [];
 
     return Scaffold(
@@ -114,7 +395,6 @@ class _HomeScreenState extends State<HomeScreen>
       body: Stack(
         children: [
           _background(),
-
           SafeArea(
             child: SingleChildScrollView(
               padding: const EdgeInsets.all(20),
@@ -122,49 +402,53 @@ class _HomeScreenState extends State<HomeScreen>
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   _topBar(),
-
                   const SizedBox(height: 26),
-
                   _heroCard(),
-
                   const SizedBox(height: 24),
-
                   _inputCard(),
-
+                  const SizedBox(height: 14),
+                  _toolsGrid(),
+                  const SizedBox(height: 14),
+                  _urlCard(),
                   const SizedBox(height: 18),
-
                   _analyzeButton(),
-
                   if (isLoading) ...[
                     const SizedBox(height: 28),
                     _loadingCard(),
                   ],
-
                   if (result != null) ...[
                     const SizedBox(height: 28),
-                    _resultHeader(verdict, trustScore),
-                    const SizedBox(height: 18),
-                    _infoCard(
-                      icon: Icons.article_rounded,
-                      title: "Simple Explanation",
-                      text: result?["simple_explanation"] ?? "",
-                    ),
-                    const SizedBox(height: 16),
-                    _redFlagsCard(redFlags),
-                    const SizedBox(height: 16),
-                    _infoCard(
-                      icon: Icons.psychology_rounded,
-                      title: "AI Reasoning",
-                      text: result?["ai_reasoning"] ?? "",
-                    ),
-                    const SizedBox(height: 16),
-                    _infoCard(
-                      icon: Icons.gavel_rounded,
-                      title: "Final Decision",
-                      text: result?["final_decision"] ?? "",
+                    _animatedResult(
+                      child: Column(
+                        children: [
+                          _resultHeader(verdict, trustScore),
+                          const SizedBox(height: 18),
+                          _infoCard(
+                            icon: Icons.article_rounded,
+                            title: "Simple Explanation",
+                            text: result?["simple_explanation"] ?? "",
+                          ),
+                          const SizedBox(height: 16),
+                          _redFlagsCard(redFlags),
+                          const SizedBox(height: 16),
+                          _infoCard(
+                            icon: Icons.psychology_rounded,
+                            title: "AI Reasoning",
+                            text: result?["ai_reasoning"] ?? "",
+                          ),
+                          const SizedBox(height: 16),
+
+                          _chatButton(),
+                          const SizedBox(height: 16),
+                          _infoCard(
+                            icon: Icons.gavel_rounded,
+                            title: "Final Decision",
+                            text: result?["final_decision"] ?? "",
+                          ),
+                        ],
+                      ),
                     ),
                   ],
-
                   const SizedBox(height: 40),
                 ],
               ),
@@ -194,19 +478,16 @@ class _HomeScreenState extends State<HomeScreen>
                 ),
               ),
             ),
-
             Positioned(
               top: -100 + glowController.value * 35,
               right: -90,
               child: _blurCircle(250, Colors.cyanAccent.withOpacity(0.18)),
             ),
-
             Positioned(
               bottom: -130,
               left: -100 + glowController.value * 45,
               child: _blurCircle(300, Colors.blueAccent.withOpacity(0.15)),
             ),
-
             Positioned(
               top: 300,
               left: 40,
@@ -285,9 +566,7 @@ class _HomeScreenState extends State<HomeScreen>
             size: 28,
           ),
         ),
-
         const SizedBox(width: 12),
-
         Expanded(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -312,21 +591,41 @@ class _HomeScreenState extends State<HomeScreen>
             ],
           ),
         ),
-
-        Container(
-          height: 46,
-          width: 46,
-          decoration: BoxDecoration(
-            color: Colors.white.withOpacity(0.08),
-            borderRadius: BorderRadius.circular(16),
-            border: Border.all(color: Colors.white.withOpacity(0.12)),
-          ),
-          child: const Icon(
-            Icons.history_rounded,
-            color: Colors.cyanAccent,
-          ),
+        GestureDetector(
+          onTap: () {
+            Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (_) => const HistoryScreen(),
+              ),
+            );
+          },
+          child: _topIcon(Icons.history_rounded),
+        ),
+        const SizedBox(width: 10),
+        GestureDetector(
+          onTap: logoutUser,
+          child: _topIcon(Icons.logout_rounded),
         ),
       ],
+    );
+  }
+
+  Widget _topIcon(IconData icon) {
+    return Container(
+      height: 46,
+      width: 46,
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.08),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(
+          color: Colors.white.withOpacity(0.12),
+        ),
+      ),
+      child: Icon(
+        icon,
+        color: Colors.cyanAccent,
+      ),
     );
   }
 
@@ -352,9 +651,7 @@ class _HomeScreenState extends State<HomeScreen>
               ),
             ),
           ),
-
           const SizedBox(height: 18),
-
           const Text(
             "Analyze news before you trust it.",
             style: TextStyle(
@@ -364,11 +661,9 @@ class _HomeScreenState extends State<HomeScreen>
               fontWeight: FontWeight.w900,
             ),
           ),
-
           const SizedBox(height: 12),
-
           const Text(
-            "Paste any headline, article, or forwarded message. TruthLens will simplify it, detect red flags, and give an AI-based trust verdict.",
+            "Paste text, extract it from screenshots, fetch from URLs, or speak it directly. TruthLens detects red flags and gives a trust verdict.",
             style: TextStyle(
               color: Colors.white70,
               fontSize: 15.5,
@@ -398,7 +693,7 @@ class _HomeScreenState extends State<HomeScreen>
                 Icon(Icons.edit_note_rounded, color: Colors.cyanAccent),
                 SizedBox(width: 10),
                 Text(
-                  "Paste News Content",
+                  "News Content",
                   style: TextStyle(
                     color: Colors.white,
                     fontSize: 17,
@@ -408,10 +703,9 @@ class _HomeScreenState extends State<HomeScreen>
               ],
             ),
           ),
-
           TextField(
             controller: newsController,
-            maxLines: 10,
+            maxLines: 7,
             style: const TextStyle(
               color: Colors.white,
               fontSize: 15.5,
@@ -420,9 +714,113 @@ class _HomeScreenState extends State<HomeScreen>
             decoration: const InputDecoration(
               contentPadding: EdgeInsets.all(18),
               hintText:
-                  "Example: Breaking news, WhatsApp forward, article paragraph, tweet, or headline...",
+                  "Paste news, extract from screenshot, fetch from URL, or use voice input...",
               hintStyle: TextStyle(color: Colors.white38),
               border: InputBorder.none,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _toolsGrid() {
+    return Row(
+      children: [
+        Expanded(
+          child: _toolButton(
+            icon: Icons.image_search_rounded,
+            label: "Screenshot",
+            onTap: isLoading ? null : pickAndReadScreenshot,
+          ),
+        ),
+        const SizedBox(width: 10),
+        Expanded(
+          child: _toolButton(
+            icon: isListening ? Icons.mic_rounded : Icons.mic_none_rounded,
+            label: isListening ? "Listening..." : "Voice",
+            onTap: isLoading ? null : startVoiceInput,
+            active: isListening,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _toolButton({
+    required IconData icon,
+    required String label,
+    required VoidCallback? onTap,
+    bool active = false,
+  }) {
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 250),
+        height: 54,
+        decoration: BoxDecoration(
+          color: active
+              ? Colors.cyanAccent.withOpacity(0.20)
+              : Colors.white.withOpacity(0.07),
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(
+            color: active
+                ? Colors.cyanAccent
+                : Colors.cyanAccent.withOpacity(0.25),
+          ),
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(icon, color: Colors.cyanAccent, size: 21),
+            const SizedBox(width: 8),
+            Text(
+              label,
+              style: const TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _urlCard() {
+    return _glassBox(
+      padding: const EdgeInsets.all(14),
+      child: Row(
+        children: [
+          Expanded(
+            child: TextField(
+              controller: urlController,
+              style: const TextStyle(color: Colors.white),
+              decoration: const InputDecoration(
+                hintText: "Paste news URL here...",
+                hintStyle: TextStyle(color: Colors.white38),
+                border: InputBorder.none,
+                prefixIcon: Icon(
+                  Icons.link_rounded,
+                  color: Colors.cyanAccent,
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          GestureDetector(
+            onTap: isLoading ? null : fetchNewsFromUrl,
+            child: Container(
+              height: 46,
+              width: 46,
+              decoration: BoxDecoration(
+                color: Colors.cyanAccent,
+                borderRadius: BorderRadius.circular(16),
+              ),
+              child: const Icon(
+                Icons.download_rounded,
+                color: Colors.black,
+              ),
             ),
           ),
         ],
@@ -492,28 +890,35 @@ class _HomeScreenState extends State<HomeScreen>
     return _glassBox(
       child: Column(
         children: [
-          const Text(
-            "TruthLens is analyzing...",
-            style: TextStyle(
-              color: Colors.white,
-              fontSize: 20,
-              fontWeight: FontWeight.bold,
+          const Icon(
+            Icons.auto_awesome_rounded,
+            color: Colors.cyanAccent,
+            size: 42,
+          ),
+          const SizedBox(height: 14),
+          AnimatedSwitcher(
+            duration: const Duration(milliseconds: 450),
+            child: Text(
+              loadingMessages[loadingIndex],
+              key: ValueKey(loadingMessages[loadingIndex]),
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 19,
+                fontWeight: FontWeight.bold,
+              ),
             ),
           ),
-
           const SizedBox(height: 12),
-
           const Text(
-            "Checking wording, claim quality, source clarity, and misinformation patterns.",
+            "TruthLens is preparing an intelligent analysis...",
             textAlign: TextAlign.center,
             style: TextStyle(
               color: Colors.white60,
               height: 1.5,
             ),
           ),
-
-          const SizedBox(height: 18),
-
+          const SizedBox(height: 20),
           LinearProgressIndicator(
             color: Colors.cyanAccent,
             backgroundColor: Colors.white.withOpacity(0.08),
@@ -525,75 +930,96 @@ class _HomeScreenState extends State<HomeScreen>
     );
   }
 
+  Widget _animatedResult({required Widget child}) {
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 700),
+      curve: Curves.easeOutCubic,
+      builder: (context, value, _) {
+        return Opacity(
+          opacity: value,
+          child: Transform.translate(
+            offset: Offset(0, 30 * (1 - value)),
+            child: child,
+          ),
+        );
+      },
+    );
+  }
+
   Widget _resultHeader(String verdict, int trustScore) {
     final color = getRiskColor(verdict);
 
-    return _glassBox(
-      child: Row(
-        children: [
-          Container(
-            height: 78,
-            width: 78,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              color: color.withOpacity(0.12),
-              border: Border.all(color: color.withOpacity(0.7), width: 2),
-              boxShadow: [
-                BoxShadow(
-                  color: color.withOpacity(0.25),
-                  blurRadius: 30,
-                ),
-              ],
-            ),
-            child: Icon(
-              getRiskIcon(verdict),
-              color: color,
-              size: 42,
-            ),
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0, end: trustScore / 100),
+      duration: const Duration(milliseconds: 900),
+      curve: Curves.easeOutCubic,
+      builder: (context, animatedScore, child) {
+        return _glassBox(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      SizedBox(
+                        height: 92,
+                        width: 92,
+                        child: CircularProgressIndicator(
+                          value: animatedScore,
+                          strokeWidth: 8,
+                          color: color,
+                          backgroundColor: Colors.white.withOpacity(0.08),
+                        ),
+                      ),
+                      Icon(
+                        getRiskIcon(verdict),
+                        color: color,
+                        size: 36,
+                      ),
+                    ],
+                  ),
+                  const SizedBox(width: 20),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          verdict,
+                          style: TextStyle(
+                            color: color,
+                            fontSize: 28,
+                            fontWeight: FontWeight.w900,
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        Text(
+                          result?["analysis_type"] ?? "Gemini AI Analysis",
+                          style: const TextStyle(
+                            color: Colors.white54,
+                            fontSize: 13,
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        Text(
+                          "Trust Score: ${(animatedScore * 100).round()}%",
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 17,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ],
           ),
-
-          const SizedBox(width: 18),
-
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  verdict,
-                  style: TextStyle(
-                    color: color,
-                    fontSize: 25,
-                    fontWeight: FontWeight.w900,
-                  ),
-                ),
-
-                const SizedBox(height: 8),
-
-                Text(
-                  "Trust Score: $trustScore%",
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 16,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-
-                const SizedBox(height: 8),
-
-                ClipRRect(
-                  borderRadius: BorderRadius.circular(50),
-                  child: LinearProgressIndicator(
-                    value: trustScore / 100,
-                    minHeight: 8,
-                    color: color,
-                    backgroundColor: Colors.white.withOpacity(0.1),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
+        );
+      },
     );
   }
 
@@ -602,37 +1028,73 @@ class _HomeScreenState extends State<HomeScreen>
     required String title,
     required String text,
   }) {
-    return _glassBox(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Icon(icon, color: Colors.cyanAccent),
-              const SizedBox(width: 10),
-              Text(
-                title,
-                style: const TextStyle(
-                  color: Colors.cyanAccent,
-                  fontSize: 18,
-                  fontWeight: FontWeight.bold,
-                ),
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 600),
+      curve: Curves.easeOut,
+      builder: (context, value, child) {
+        return Opacity(
+          opacity: value,
+          child: Transform.translate(
+            offset: Offset(0, 20 * (1 - value)),
+            child: _glassBox(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Container(
+                        height: 42,
+                        width: 42,
+                        decoration: BoxDecoration(
+                          color: Colors.cyanAccent.withOpacity(0.12),
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                        child: Icon(
+                          icon,
+                          color: Colors.cyanAccent,
+                          size: 23,
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Text(
+                          title,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 19,
+                            fontWeight: FontWeight.w900,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withOpacity(0.18),
+                      borderRadius: BorderRadius.circular(18),
+                      border: Border.all(
+                        color: Colors.white.withOpacity(0.08),
+                      ),
+                    ),
+                    child: Text(
+                      text.toString(),
+                      style: const TextStyle(
+                        color: Colors.white70,
+                        fontSize: 15.8,
+                        height: 1.65,
+                      ),
+                    ),
+                  ),
+                ],
               ),
-            ],
-          ),
-
-          const SizedBox(height: 12),
-
-          Text(
-            text.toString(),
-            style: const TextStyle(
-              color: Colors.white70,
-              fontSize: 15.5,
-              height: 1.55,
             ),
           ),
-        ],
-      ),
+        );
+      },
     );
   }
 
@@ -643,67 +1105,104 @@ class _HomeScreenState extends State<HomeScreen>
       flags = redFlags;
     }
 
-    return _glassBox(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Row(
-            children: [
-              Icon(Icons.flag_rounded, color: Colors.orangeAccent),
-              SizedBox(width: 10),
-              Text(
-                "Red Flags Found",
-                style: TextStyle(
-                  color: Colors.orangeAccent,
-                  fontSize: 18,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-            ],
-          ),
-
-          const SizedBox(height: 12),
-
-          if (flags.isEmpty)
-            const Text(
-              "No major red flags found.",
-              style: TextStyle(color: Colors.white70),
-            )
-          else
-            ...flags.map(
-              (flag) => Container(
-                margin: const EdgeInsets.only(bottom: 10),
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: Colors.orangeAccent.withOpacity(0.08),
-                  borderRadius: BorderRadius.circular(14),
-                  border: Border.all(
-                    color: Colors.orangeAccent.withOpacity(0.2),
-                  ),
-                ),
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      "⚠ ",
-                      style: TextStyle(fontSize: 16),
-                    ),
-                    Expanded(
-                      child: Text(
-                        flag.toString(),
-                        style: const TextStyle(
-                          color: Colors.white70,
-                          fontSize: 15,
-                          height: 1.4,
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 650),
+      curve: Curves.easeOut,
+      builder: (context, value, child) {
+        return Opacity(
+          opacity: value,
+          child: Transform.translate(
+            offset: Offset(0, 20 * (1 - value)),
+            child: _glassBox(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Container(
+                        height: 42,
+                        width: 42,
+                        decoration: BoxDecoration(
+                          color: Colors.orangeAccent.withOpacity(0.14),
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                        child: const Icon(
+                          Icons.report_problem_rounded,
+                          color: Colors.orangeAccent,
                         ),
                       ),
+                      const SizedBox(width: 12),
+                      const Text(
+                        "Red Flags Found",
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 19,
+                          fontWeight: FontWeight.w900,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+                  if (flags.isEmpty)
+                    const Text(
+                      "No major red flags found.",
+                      style: TextStyle(color: Colors.white70),
+                    )
+                  else
+                    ...flags.asMap().entries.map(
+                      (entry) {
+                        int index = entry.key;
+                        String flag = entry.value.toString();
+
+                        return Container(
+                          margin: const EdgeInsets.only(bottom: 12),
+                          padding: const EdgeInsets.all(14),
+                          decoration: BoxDecoration(
+                            color: Colors.orangeAccent.withOpacity(0.08),
+                            borderRadius: BorderRadius.circular(18),
+                            border: Border.all(
+                              color: Colors.orangeAccent.withOpacity(0.22),
+                            ),
+                          ),
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              CircleAvatar(
+                                radius: 13,
+                                backgroundColor:
+                                    Colors.orangeAccent.withOpacity(0.18),
+                                child: Text(
+                                  "${index + 1}",
+                                  style: const TextStyle(
+                                    color: Colors.orangeAccent,
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Text(
+                                  flag,
+                                  style: const TextStyle(
+                                    color: Colors.white70,
+                                    fontSize: 15.5,
+                                    height: 1.45,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        );
+                      },
                     ),
-                  ],
-                ),
+                ],
               ),
             ),
-        ],
-      ),
+          ),
+        );
+      },
     );
   }
 }
