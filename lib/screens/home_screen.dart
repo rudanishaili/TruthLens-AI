@@ -17,6 +17,7 @@ import '../services/history_service.dart';
 import 'history_screen.dart';
 import 'login_screen.dart';
 import 'chat_screen.dart';
+import 'learning_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   final String userName;
@@ -77,32 +78,92 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
 Widget _chatButton() {
-  return SizedBox(
-    width: double.infinity,
-    height: 55,
-    child: ElevatedButton.icon(
-      onPressed: result == null
-          ? null
-          : () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (_) => ChatScreen(
-                    newsText: newsController.text.trim(),
-                    analysisResult: result!,
+  return TweenAnimationBuilder<double>(
+    tween: Tween(begin: 0, end: 1),
+    duration: const Duration(milliseconds: 650),
+    curve: Curves.easeOutCubic,
+    builder: (context, value, child) {
+      return Opacity(
+        opacity: value,
+        child: Transform.translate(
+          offset: Offset(0, 22 * (1 - value)),
+          child: GestureDetector(
+            onTap: result == null
+                ? null
+                : () {
+                    Navigator.push(
+                      context,
+                      PageRouteBuilder(
+                        transitionDuration: const Duration(milliseconds: 600),
+                        pageBuilder: (_, animation, __) => ChatScreen(
+                          newsText: newsController.text.trim(),
+                          analysisResult: result!,
+                        ),
+                        transitionsBuilder: (_, animation, __, child) {
+                          return FadeTransition(
+                            opacity: animation,
+                            child: SlideTransition(
+                              position: Tween<Offset>(
+                                begin: const Offset(0, 0.06),
+                                end: Offset.zero,
+                              ).animate(animation),
+                              child: child,
+                            ),
+                          );
+                        },
+                      ),
+                    );
+                  },
+            child: AnimatedBuilder(
+              animation: glowController,
+              builder: (context, child) {
+                return Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(18),
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(24),
+                    gradient: const LinearGradient(
+                      colors: [
+                        Color(0xff67E8F9),
+                        Colors.cyanAccent,
+                      ],
+                    ),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.cyanAccent.withOpacity(
+                          0.25 + glowController.value * 0.18,
+                        ),
+                        blurRadius: 28,
+                        spreadRadius: 1,
+                        offset: const Offset(0, 12),
+                      ),
+                    ],
                   ),
-                ),
-              );
-            },
-      icon: const Icon(Icons.chat_bubble_outline_rounded),
-      label: const Text(
-        "Chat About This News",
-        style: TextStyle(
-          fontSize: 17,
-          fontWeight: FontWeight.bold,
+                  child: const Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(
+                        Icons.chat_bubble_outline_rounded,
+                        color: Colors.black,
+                      ),
+                      SizedBox(width: 10),
+                      Text(
+                        "Chat About This News",
+                        style: TextStyle(
+                          color: Colors.black,
+                          fontSize: 17,
+                          fontWeight: FontWeight.w900,
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
+          ),
         ),
-      ),
-    ),
+      );
+    },
   );
 }
 
@@ -404,6 +465,8 @@ Widget _chatButton() {
                   _topBar(),
                   const SizedBox(height: 26),
                   _heroCard(),
+                  const SizedBox(height: 16),
+                  _learningButton(),
                   const SizedBox(height: 24),
                   _inputCard(),
                   const SizedBox(height: 14),
@@ -437,14 +500,13 @@ Widget _chatButton() {
                             text: result?["ai_reasoning"] ?? "",
                           ),
                           const SizedBox(height: 16),
-
-                          _chatButton(),
-                          const SizedBox(height: 16),
                           _infoCard(
                             icon: Icons.gavel_rounded,
                             title: "Final Decision",
                             text: result?["final_decision"] ?? "",
                           ),
+                          const SizedBox(height: 18),
+                          _chatButton(),
                         ],
                       ),
                     ),
@@ -672,6 +734,110 @@ Widget _chatButton() {
           ),
         ],
       ),
+    );
+  }
+
+
+  Widget _learningButton() {
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 650),
+      curve: Curves.easeOutCubic,
+      builder: (context, value, child) {
+        return Opacity(
+          opacity: value,
+          child: Transform.translate(
+            offset: Offset(0, 18 * (1 - value)),
+            child: GestureDetector(
+              onTap: () {
+                Navigator.push(
+                  context,
+                  PageRouteBuilder(
+                    transitionDuration: const Duration(milliseconds: 600),
+                    pageBuilder: (_, animation, __) => const LearningScreen(),
+                    transitionsBuilder: (_, animation, __, child) {
+                      return FadeTransition(
+                        opacity: animation,
+                        child: SlideTransition(
+                          position: Tween<Offset>(
+                            begin: const Offset(0, 0.06),
+                            end: Offset.zero,
+                          ).animate(animation),
+                          child: child,
+                        ),
+                      );
+                    },
+                  ),
+                );
+              },
+              child: AnimatedBuilder(
+                animation: glowController,
+                builder: (context, child) {
+                  return Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(18),
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(24),
+                      color: Colors.white.withOpacity(0.075),
+                      border: Border.all(
+                        color: Colors.cyanAccent.withOpacity(0.22),
+                      ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.cyanAccent.withOpacity(
+                            0.07 + glowController.value * 0.06,
+                          ),
+                          blurRadius: 26,
+                          offset: const Offset(0, 12),
+                        ),
+                      ],
+                    ),
+                    child: const Row(
+                      children: [
+                        Icon(
+                          Icons.school_rounded,
+                          color: Colors.cyanAccent,
+                          size: 28,
+                        ),
+                        SizedBox(width: 14),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                "AI News Learning Mode",
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 17,
+                                  fontWeight: FontWeight.w900,
+                                ),
+                              ),
+                              SizedBox(height: 4),
+                              Text(
+                                "Learn fake-news red flags, clickbait tricks, and verification steps.",
+                                style: TextStyle(
+                                  color: Colors.white60,
+                                  fontSize: 13,
+                                  height: 1.35,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        Icon(
+                          Icons.arrow_forward_ios_rounded,
+                          color: Colors.white54,
+                          size: 18,
+                        ),
+                      ],
+                    ),
+                  );
+                },
+              ),
+            ),
+          ),
+        );
+      },
     );
   }
 
