@@ -13,7 +13,7 @@ class AppTheme {
     appBarTheme: const AppBarTheme(
       backgroundColor: Color(0xff111827),
       centerTitle: true,
-      elevation: 0,
+      elevation: 1,
     ),
 
     colorScheme: ColorScheme.dark(
